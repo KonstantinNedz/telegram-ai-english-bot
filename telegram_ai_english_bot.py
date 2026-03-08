@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # telegram_ai_english_bot.py
-# Упрощённая версия: только "Учим новые слова", "Повторяем слова", "Список моих слов".
-# TTS сохранён (через gTTS). Хранение: SQLite.
+# Миграция на OpenAI v1 client + TTS + упрощённый функционал: Учим / Повторяем / Список
 
 import os
 import logging
@@ -11,6 +10,7 @@ import re
 import random
 import datetime
 import tempfile
+import html
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
@@ -21,8 +21,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import openai
+# OpenAI v1 client
 from openai import OpenAI
+
 # Optional TTS
 try:
     from gtts import gTTS
@@ -39,10 +40,10 @@ DB_PATH = os.getenv("BOT_DB_PATH", "english_bot.db")
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("Please set TELEGRAM_TOKEN and OPENAI_API_KEY environment variables")
 
+# create new OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
-# reduce httpx debug noise
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.INFO)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
@@ -85,13 +86,6 @@ def delete_word_by_id(word_id: int):
     conn.commit()
     conn.close()
 
-def delete_word_by_text(user_id: int, word_text: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM review_words WHERE user_id=? AND word=?", (user_id, word_text))
-    conn.commit()
-    conn.close()
-
 def get_all_words(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -100,22 +94,18 @@ def get_all_words(user_id: int):
     conn.close()
     return rows
 
-# ---------------- OpenAI helpers ----------------
+# ---------------- OpenAI helpers (new SDK) ----------------
 
 def generate_word_via_ai() -> dict:
     """
-    Генерирует одно слово через новый OpenAI Python SDK (v>=1.0).
-    Возвращает словарь:
-      {"word": str, "transcription": str, "translation": str, "examples": [str,str,str]}
-    Если что-то пошло не так — возвращает fallback-слово.
+    Use OpenAI v1 client (client.chat.completions.create) to get a JSON object describing one word.
+    Returns dict with keys: word, transcription, translation, examples (list of 3).
     """
     prompt = (
         "Generate one useful English vocabulary word for a language learner and return STRICT JSON only in the following format:\n"
         "{\n  \"word\": \"...\",\n  \"transcription\": \"...\",\n  \"translation\": \"...\",\n  \"examples\": [\"...\", \"...\", \"...\"]\n}\n\nReturn no additional text."
     )
-
     try:
-        # Вызов нового API
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
@@ -123,24 +113,20 @@ def generate_word_via_ai() -> dict:
             max_tokens=250,
         )
 
-        # Попытки безопасно извлечь текст ответа — разные версии SDK возвращают результат немного по-разному.
+        # try different ways to extract text depending on SDK minor variations
         text = None
         try:
-            # Наиболее вероятная форма: resp.choices[0].message.content
             text = resp.choices[0].message.content
         except Exception:
             try:
-                # Альтернативная форма: resp.choices[0].message["content"]
                 text = resp.choices[0].message["content"]
             except Exception:
                 try:
-                    # Иногда SDK возвращает dict-подобную структуру:
                     text = resp["choices"][0]["message"]["content"]
                 except Exception:
-                    # В крайнем случае — превратим ответ в строку
                     text = str(resp)
 
-        # Попытка распарсить JSON из текста
+        # parse JSON from text (safe)
         try:
             data = json.loads(text)
         except Exception:
@@ -150,7 +136,6 @@ def generate_word_via_ai() -> dict:
             else:
                 raise
 
-        # Нормализация полей
         examples = data.get("examples", [])
         if not isinstance(examples, list):
             examples = [str(examples)]
@@ -164,7 +149,6 @@ def generate_word_via_ai() -> dict:
         }
 
     except Exception:
-        # Логируем ошибку и возвращаем fallback
         logger.exception("AI generation failed; returning fallback word")
         return {
             "word": "example",
@@ -172,7 +156,6 @@ def generate_word_via_ai() -> dict:
             "translation": "пример",
             "examples": ["This is an example sentence.", "For example, ...", "Another example."],
         }
-    
 
 # ---------------- TTS ----------------
 
@@ -193,7 +176,6 @@ def synthesize_tts(text: str, lang: str = "en") -> str | None:
 # ---------------- Telegram handlers ----------------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # After /start show three buttons: Учим новые слова, Повторяем слова, Список моих слов
     keyboard = [
         [InlineKeyboardButton("📗 Учим новые слова", callback_data="learn_words")],
         [InlineKeyboardButton("🔁 Повторяем слова", callback_data="review_words")],
@@ -201,11 +183,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# Words menu (callback entry for words)
 async def words_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # reuse start-style menu
     keyboard = [
         [InlineKeyboardButton("📗 Учим новые слова", callback_data="learn_words")],
         [InlineKeyboardButton("🔁 Повторяем слова", callback_data="review_words")],
@@ -213,7 +193,7 @@ async def words_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await query.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# Learn: generate and present word
+# Learn: generate and present word (with bold HTML + tts)
 async def learn_words_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -225,18 +205,29 @@ async def learn_words_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_generated_word_cb(query, context, data)
 
 async def send_generated_word_cb(query, context, data):
-    text = (
-        f"Word: {data['word']}\nTranscription: {data.get('transcription','')}\nTranslation: {data.get('translation','')}\n\n"
-        f"Examples:\n- {data['examples'][0]}\n- {data['examples'][1]}\n- {data['examples'][2]}"
-    )
+    word_safe = html.escape(data.get('word','') or "")
+    transcription = html.escape(data.get('transcription','') or "")
+    translation = html.escape(data.get('translation','') or "")
+    examples = data.get('examples', [])
+    text = f"<b>{word_safe}</b>\n\n"
+    if transcription:
+        text += f"<i>{transcription}</i>\n\n"
+    if translation:
+        text += f"Translation: {translation}\n\n"
+    text += "Examples:\n"
+    for ex in examples:
+        text += f"- {html.escape(ex)}\n"
+
     keyboard = [
-        [InlineKeyboardButton("✅ Учить (сохранить)", callback_data="save_word")],
+        [InlineKeyboardButton("✅ Учить (сохранить)", callback_data="save_word"),
+         InlineKeyboardButton("🔊 Произношение", callback_data="tts_gen")],
         [InlineKeyboardButton("⏭ Пропустить (следующее)", callback_data="next_generated")],
         [InlineKeyboardButton("⬅ Предыдущее", callback_data="prev_generated")],
     ]
     keyboard.append([InlineKeyboardButton("➕ Добавить своё слово", callback_data="manual_add")])
     keyboard.append([InlineKeyboardButton("⬅ Главное меню", callback_data="menu")])
-    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 async def save_word_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -287,7 +278,6 @@ async def handle_manual_add_message(update: Update, context: ContextTypes.DEFAUL
         return
     text = update.message.text.strip()
     user_id = update.effective_user.id
-    # try simple parse by dash or comma
     parts = re.split(r'[-—–]', text, maxsplit=3)
     if len(parts) == 1:
         parts = [p.strip() for p in text.split(',', 3)]
@@ -315,7 +305,6 @@ async def review_words_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await query.message.reply_text("Ваш список повторения пуст. Добавьте слова через 'Учим новые слова' или '➕ Добавить своё слово'.")
         return
-    # rows: list of (id, word, transcription, translation, examples, added_at)
     context.user_data["review_words"] = rows
     context.user_data["review_index"] = 0
     await send_review_item_cb(query, context)
@@ -365,7 +354,6 @@ async def delete_word_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Неверный запрос на удаление.")
         return
     word_id = int(m.group(1))
-    # find position in session list and remove
     rows = context.user_data.get("review_words", [])
     idx = None
     for i, row in enumerate(rows):
@@ -376,12 +364,10 @@ async def delete_word_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if idx is not None:
         rows.pop(idx)
         context.user_data["review_words"] = rows
-        # adjust index
         if context.user_data.get("review_index", 0) >= len(rows) and len(rows) > 0:
             context.user_data["review_index"] = len(rows) - 1
     await query.message.reply_text("Слово удалено.")
     if rows:
-        # show current item
         await send_review_item_cb(query, context)
     else:
         await query.message.reply_text("Список повторения теперь пуст.")
@@ -397,7 +383,7 @@ async def next_review_word_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await send_review_item_cb(query, context)
 
-# TTS callback
+# TTS handlers
 async def tts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -430,6 +416,31 @@ async def tts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+async def tts_generated_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx = context.user_data.get("generated_index")
+    hist = context.user_data.get("generated_history", [])
+    if idx is None or idx >= len(hist):
+        await query.message.reply_text("Нет текущего сгенерированного слова для озвучивания.")
+        return
+    w = hist[idx]
+    word = w.get("word") or ""
+    if not TTS_AVAILABLE:
+        await query.message.reply_text("TTS недоступен в этом окружении. Установите gTTS в requirements.")
+        return
+    tmp = synthesize_tts(word)
+    if not tmp:
+        await query.message.reply_text("Ошибка при генерации аудио.")
+        return
+    try:
+        await query.message.reply_audio(audio=InputFile(tmp), caption=f"Pronunciation: {word}")
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
 # List my words
 async def list_my_words_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -442,11 +453,10 @@ async def list_my_words_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         wid, w, tr, trans, ex, added = r
         lines.append(f"{w} — {tr or trans}")
-    # send in chunks if too long
     msg = "Ваши слова:\n" + "\n".join(lines[:200])
     await query.message.reply_text(msg)
 
-# Generic "menu" handler to go to main menu
+# Generic "menu" handler
 async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -462,7 +472,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("awaiting_manual_add"):
         await handle_manual_add_message(update, context)
         return
-    # otherwise ignore
     return
 
 # ---------------- Main ----------------
@@ -474,7 +483,7 @@ def main():
     # commands
     app.add_handler(CommandHandler("start", start_cmd))
 
-    # main menu and flows
+    # flows
     app.add_handler(CallbackQueryHandler(words_menu_cb, pattern="^menu$|^words$"))
     app.add_handler(CallbackQueryHandler(learn_words_cb, pattern="^learn_words$"))
     app.add_handler(CallbackQueryHandler(save_word_cb, pattern="^save_word$"))
@@ -487,11 +496,12 @@ def main():
     app.add_handler(CallbackQueryHandler(delete_word_cb, pattern="^delete_word_"))
     app.add_handler(CallbackQueryHandler(next_review_word_cb, pattern="^next_review_word$"))
     app.add_handler(CallbackQueryHandler(list_my_words_cb, pattern="^list_my_words$"))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^menu$"))
 
     app.add_handler(CallbackQueryHandler(tts_cb, pattern="^tts_"))
+    app.add_handler(CallbackQueryHandler(tts_generated_cb, pattern="^tts_gen$"))
 
-    # messages
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^menu$"))
+
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_router))
 
     logger.info("Bot started")
@@ -499,4 +509,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
