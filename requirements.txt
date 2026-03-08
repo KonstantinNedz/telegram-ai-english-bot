@@ -1,5 +1,6 @@
-python-telegram-bot==20.5
+python-telegram-bot==22.6
 openai
 gTTS
 psycopg2-binary
+
 python-dotenv
