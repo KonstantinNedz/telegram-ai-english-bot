@@ -22,7 +22,7 @@ from telegram.ext import (
     filters,
 )
 import openai
-
+from openai import OpenAI
 # Optional TTS
 try:
     from gtts import gTTS
@@ -39,7 +39,7 @@ DB_PATH = os.getenv("BOT_DB_PATH", "english_bot.db")
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("Please set TELEGRAM_TOKEN and OPENAI_API_KEY environment variables")
 
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 # reduce httpx debug noise
@@ -104,22 +104,43 @@ def get_all_words(user_id: int):
 
 def generate_word_via_ai() -> dict:
     """
-    Ask OpenAI to output a single word in strict JSON form.
-    Returns dict with keys: word, transcription, translation, examples(list).
-    Fallback to a safe stub if parsing fails.
+    Генерирует одно слово через новый OpenAI Python SDK (v>=1.0).
+    Возвращает словарь:
+      {"word": str, "transcription": str, "translation": str, "examples": [str,str,str]}
+    Если что-то пошло не так — возвращает fallback-слово.
     """
     prompt = (
         "Generate one useful English vocabulary word for a language learner and return STRICT JSON only in the following format:\n"
         "{\n  \"word\": \"...\",\n  \"transcription\": \"...\",\n  \"translation\": \"...\",\n  \"examples\": [\"...\", \"...\", \"...\"]\n}\n\nReturn no additional text."
     )
+
     try:
-        resp = openai.ChatCompletion.create(
+        # Вызов нового API
+        resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.6,
-            max_tokens=250
+            max_tokens=250,
         )
-        text = resp.choices[0].message.content.strip()
+
+        # Попытки безопасно извлечь текст ответа — разные версии SDK возвращают результат немного по-разному.
+        text = None
+        try:
+            # Наиболее вероятная форма: resp.choices[0].message.content
+            text = resp.choices[0].message.content
+        except Exception:
+            try:
+                # Альтернативная форма: resp.choices[0].message["content"]
+                text = resp.choices[0].message["content"]
+            except Exception:
+                try:
+                    # Иногда SDK возвращает dict-подобную структуру:
+                    text = resp["choices"][0]["message"]["content"]
+                except Exception:
+                    # В крайнем случае — превратим ответ в строку
+                    text = str(resp)
+
+        # Попытка распарсить JSON из текста
         try:
             data = json.loads(text)
         except Exception:
@@ -128,18 +149,22 @@ def generate_word_via_ai() -> dict:
                 data = json.loads(m.group(0))
             else:
                 raise
+
+        # Нормализация полей
         examples = data.get("examples", [])
         if not isinstance(examples, list):
             examples = [str(examples)]
         while len(examples) < 3:
             examples.append("")
         return {
-            "word": data.get("word", "").strip(),
-            "transcription": data.get("transcription", "").strip(),
-            "translation": data.get("translation", "").strip(),
+            "word": str(data.get("word", "")).strip(),
+            "transcription": str(data.get("transcription", "")).strip(),
+            "translation": str(data.get("translation", "")).strip(),
             "examples": examples[:3],
         }
+
     except Exception:
+        # Логируем ошибку и возвращаем fallback
         logger.exception("AI generation failed; returning fallback word")
         return {
             "word": "example",
@@ -147,6 +172,7 @@ def generate_word_via_ai() -> dict:
             "translation": "пример",
             "examples": ["This is an example sentence.", "For example, ...", "Another example."],
         }
+    
 
 # ---------------- TTS ----------------
 
@@ -473,3 +499,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
