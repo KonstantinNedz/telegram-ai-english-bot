@@ -1,0 +1,1 @@
+web: python telegram_ai_english_bot.py
